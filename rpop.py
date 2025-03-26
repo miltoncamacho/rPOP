@@ -27,6 +27,7 @@ from nipype.interfaces.matlab import MatlabCommand
 ###############################################################################
 # Logging Configuration
 ###############################################################################
+# Configure logging to output messages to the console with timestamps
 logger = logging.getLogger("rpop")
 logger.setLevel(logging.INFO)
 
@@ -42,6 +43,10 @@ logger.addHandler(ch)
 # Function to reset NIfTI origin to center
 ###############################################################################
 def reset_origin_to_center(nifti_file):
+    """
+    Reset image origin to the center of the volume.
+    Equivalent to MATLAB's spm_get_space with inverse voxel shift.
+    """
     logger.info(f"Resetting origin to center: {nifti_file}")
     img = nib.load(nifti_file)
     hdr = img.header.copy()
@@ -57,6 +62,7 @@ def reset_origin_to_center(nifti_file):
 # Main rPOP Logic
 ###############################################################################
 def main():
+    # Argument parser to replace user input and spm_select from MATLAB
     parser = argparse.ArgumentParser(
         description="Python rPOP using Nipype (SPM old normalization + AFNI FWHMx) and logging."
     )
@@ -81,9 +87,11 @@ def main():
 
     args = parser.parse_args()
 
+    # Configure SPM command if provided
     if args.spm_cmd:
         MatlabCommand.set_default_matlab_cmd(args.spm_cmd)
 
+    # Parse and validate voxel size
     try:
         vox_size = list(map(float, args.vox_size.split(",")))
         if len(vox_size) != 3:
@@ -92,6 +100,7 @@ def main():
         logger.error("--vox-size must be three comma-separated numbers, e.g. '2,2,2'")
         sys.exit(1)
 
+    # Parse and validate bounding box
     try:
         bbox_vals = list(map(float, args.bbox.split(",")))
         if len(bbox_vals) != 6:
@@ -105,9 +114,11 @@ def main():
     logger.info(f"Using bounding box: {bounding_box}")
     logger.info(f"Target FWHM: {args.target_fwhm}")
 
+    # Set up template paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
     tdir = os.path.join(script_dir, "templates")
 
+    # List of all templates grouped by tracer
     tfbpall  = [os.path.join(tdir, "Template_FBP_all.nii")]
     tfbppos  = [os.path.join(tdir, "Template_FBP_pos.nii")]
     tfbpneg  = [os.path.join(tdir, "Template_FBP_neg.nii")]
@@ -118,11 +129,13 @@ def main():
     tflutepos= [os.path.join(tdir, "Template_FLUTE_pos.nii")]
     tfluteneg= [os.path.join(tdir, "Template_FLUTE_neg.nii")]
 
+    # Combine template sets by tracer
     warptempl_fbp = tfbpall + tfbppos + tfbpneg
     warptempl_fbb = tfbball + tfbbpos + tfbbneg
     warptempl_flute = tfluteall + tflutepos + tfluteneg
     warptempl_all = warptempl_fbp + warptempl_fbb + warptempl_flute
 
+    # Select templates based on user input
     if args.template_choice == 1:
         warptempl = warptempl_all
     elif args.template_choice == 2:
@@ -134,6 +147,7 @@ def main():
 
     logger.info(f"Selected template set: {warptempl}")
 
+    # Set up SPM Normalize interface
     norm = Normalize()
     norm.inputs.jobtype = "estwrite"
     norm.inputs.write_bounding_box = bounding_box
@@ -143,12 +157,15 @@ def main():
     norm.inputs.out_prefix = "w"
     norm.inputs.template = warptempl
 
+    # Set up SPM Smooth interface
     smoother = Smooth()
     smoother.inputs.out_prefix = "s"
 
+    # Prepare CSV log tables
     dbests = []
     dbwarn = []
 
+    # Loop through input NIfTI volumes
     for vol in args.volumes:
         vol = os.path.abspath(vol)
         if not os.path.isfile(vol):
@@ -168,10 +185,12 @@ def main():
             logger.error(f"Normalization failed: {e}")
             continue
 
+        # Get warped image from SPM output
         warped_file = res.outputs.normalized_files[0]
         base = os.path.splitext(warped_file)[0]
         txtfwhm = base + "_automask.txt"
 
+        # Estimate FWHM with 3dFWHMx and -2difMAD
         cmd = [args.afni_fwhmx, "-automask", "-2difMAD", "-input", warped_file, "-out", txtfwhm]
         subprocess.run(cmd)
 
@@ -179,6 +198,7 @@ def main():
             logger.error(f"FWHM output missing: {txtfwhm}")
             continue
 
+        # Read estimated FWHM values
         with open(txtfwhm, "r") as f:
             lines = f.read().strip().split()
 
@@ -188,6 +208,7 @@ def main():
             logger.error(f"Could not parse FWHM: {e}")
             continue
 
+        # Check for abnormal FWHM and re-run without -2difMAD if needed
         rerun_flag = "0"
         if max(fx, fy, fz) > 25:
             logger.warning(f"High FWHM detected. Re-running without -2difMAD.")
@@ -200,6 +221,7 @@ def main():
                 fx, fy, fz = map(float, lines[:3])
                 dbwarn.append(f"High FWHM rerun: {warped_file}")
 
+        # Compute differential smoothing to target FWHM
         def fwhm_filter(est, target):
             return 0 if est > target else math.sqrt(target**2 - est**2)
 
@@ -207,16 +229,19 @@ def main():
         filty = fwhm_filter(fy, args.target_fwhm)
         filtz = fwhm_filter(fz, args.target_fwhm)
 
+        # Smooth the image using calculated filters
         smoother.inputs.in_files = warped_file
         smoother.inputs.fwhm = [filtx, filty, filtz]
         smoother.run()
 
+        # Log output data for CSV
         dbests.append([
             warped_file,
             f"{fx:.4f}", f"{fy:.4f}", f"{fz:.4f}",
             f"{filtx:.4f}", f"{filty:.4f}", f"{filtz:.4f}", rerun_flag
         ])
 
+    # Write main CSV
     timestamp = datetime.datetime.now().strftime("%m-%d-%Y_%H-%M-%S")
     main_csv = os.path.join(args.outdir, f"rPOP_{timestamp}.csv")
     with open(main_csv, "w", newline="") as f:
@@ -228,6 +253,7 @@ def main():
         ])
         writer.writerows(dbests)
 
+    # Write warnings if needed
     if dbwarn:
         warn_csv = os.path.join(args.outdir, f"rPOPWarnings_{timestamp}.csv")
         with open(warn_csv, "w", newline="") as f:
